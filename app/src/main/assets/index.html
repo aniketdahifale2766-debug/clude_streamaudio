@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>WiFi Audio Stream</title>
+<style>
+  body { font-family: sans-serif; background:#111; color:#eee; text-align:center; padding-top:40px; }
+  button { font-size:18px; padding:12px 24px; border-radius:8px; border:none; background:#1565C0; color:white; }
+  input[type=range] { width: 80%; }
+  #status { margin-top: 20px; color: #9ad; }
+</style>
+</head>
+<body>
+  <h2>WiFi Audio Stream</h2>
+  <button id="startBtn">Tap to Start Listening</button>
+  <div id="status">Not connected</div>
+  <div style="margin-top:30px;">
+    <label>Latency: <span id="latencyLabel">200</span> ms</label><br/>
+    <input type="range" id="latencySlider" min="80" max="1000" value="200" />
+  </div>
+
+<script>
+const startBtn = document.getElementById('startBtn');
+const statusEl = document.getElementById('status');
+const slider = document.getElementById('latencySlider');
+const latencyLabel = document.getElementById('latencyLabel');
+
+let audioCtx, workletNode, socket;
+let targetLatencyMs = parseInt(slider.value, 10);
+
+slider.addEventListener('input', () => {
+  targetLatencyMs = parseInt(slider.value, 10);
+  latencyLabel.textContent = targetLatencyMs;
+  if (workletNode) {
+    workletNode.port.postMessage({ type: 'setLatency', value: targetLatencyMs });
+  }
+});
+
+const workletCode = `
+class JitterBufferProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.queue = [];
+    this.targetSamples = Math.floor(sampleRate * 0.2);
+    this.started = false;
+    this.port.onmessage = (e) => {
+      if (e.data.type === 'push') {
+        this.queue.push(...e.data.samples);
+      } else if (e.data.type === 'setLatency') {
+        this.targetSamples = Math.floor(sampleRate * (e.data.value / 1000));
+      }
+    };
+  }
+  process(inputs, outputs) {
+    const output = outputs[0];
+    const left = output[0];
+    const right = output[1] || output[0];
+
+    if (!this.started) {
+      if (this.queue.length < this.targetSamples * 2) {
+        left.fill(0); right.fill(0);
+        return true;
+      }
+      this.started = true;
+    }
+
+    for (let i = 0; i < left.length; i++) {
+      if (this.queue.length >= 2) {
+        left[i] = this.queue.shift();
+        right[i] = this.queue.shift();
+      } else {
+        left[i] = 0; right[i] = 0;
+        this.started = false;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('jitter-buffer-processor', JitterBufferProcessor);
+`;
+
+async function start() {
+  audioCtx = new AudioContext({ sampleRate: 48000 });
+  const blob = new Blob([workletCode], { type: 'application/javascript' });
+  const url = URL.createObjectURL(blob);
+  await audioCtx.audioWorklet.addModule(url);
+
+  workletNode = new AudioWorkletNode(audioCtx, 'jitter-buffer-processor', {
+    outputChannelCount: [2]
+  });
+  workletNode.connect(audioCtx.destination);
+  workletNode.port.postMessage({ type: 'setLatency', value: targetLatencyMs });
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  socket = new WebSocket(`${proto}://${location.host}/stream`);
+  socket.binaryType = 'arraybuffer';
+
+  socket.onopen = () => { statusEl.textContent = 'Connected — buffering...'; };
+  socket.onclose = () => { statusEl.textContent = 'Disconnected'; };
+  socket.onerror = () => { statusEl.textContent = 'Connection error'; };
+
+  socket.onmessage = (event) => {
+    const view = new Int16Array(event.data);
+    const samples = new Float32Array(view.length);
+    for (let i = 0; i < view.length; i++) {
+      samples[i] = view[i] / 32768;
+    }
+    workletNode.port.postMessage({ type: 'push', samples: Array.from(samples) });
+    statusEl.textContent = 'Streaming';
+  };
+}
+
+startBtn.addEventListener('click', () => {
+  start();
+  startBtn.disabled = true;
+  startBtn.textContent = 'Listening...';
+});
+</script>
+</body>
+</html>
