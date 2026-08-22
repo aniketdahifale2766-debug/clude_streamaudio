@@ -52,7 +52,7 @@ class AudioStreamService : Service() {
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private var server: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
+    private var server: ApplicationEngine? = null
     private var mediaProjection: MediaProjection? = null
     private var audioRecord: AudioRecord? = null
     private val clients = CopyOnWriteArraySet<DefaultWebSocketServerSession>()
