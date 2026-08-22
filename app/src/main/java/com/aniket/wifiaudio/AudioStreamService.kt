@@ -41,6 +41,9 @@ class AudioStreamService : Service() {
         private const val SAMPLE_RATE = 48000
         private const val PORT = 8080
 
+        const val ACTION_ERROR = "com.aniket.wifiaudio.ACTION_ERROR"
+        const val EXTRA_ERROR_MESSAGE = "error_message"
+
         fun start(context: Context, resultCode: Int, data: Intent) {
             val intent = Intent(context, AudioStreamService::class.java)
             intent.putExtra("resultCode", resultCode)
@@ -71,6 +74,7 @@ class AudioStreamService : Service() {
             startServer()
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start embedded server", e)
+            reportError("Server failed to start: ${e.message}")
         }
 
         val resultCode = intent?.getIntExtra("resultCode", -1) ?: -1
@@ -89,6 +93,7 @@ class AudioStreamService : Service() {
                 startCapture()
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start audio capture", e)
+                reportError("Audio capture failed: ${e.javaClass.simpleName}: ${e.message}")
             }
         }
         return START_NOT_STICKY
@@ -104,9 +109,23 @@ class AudioStreamService : Service() {
         serviceScope.cancel()
     }
 
+    private fun reportError(message: String) {
+        val intent = Intent(ACTION_ERROR).apply {
+            putExtra(EXTRA_ERROR_MESSAGE, message)
+            setPackage(packageName)
+        }
+        sendBroadcast(intent)
+    }
+
     private fun startCapture() {
-        val projection = mediaProjection ?: return
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        val projection = mediaProjection ?: run {
+            reportError("No MediaProjection available")
+            return
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            reportError("Playback capture requires Android 10+")
+            return
+        }
 
         val config = AudioPlaybackCaptureConfiguration.Builder(projection)
             .addMatchingUsage(android.media.AudioAttributes.USAGE_MEDIA)
@@ -123,20 +142,37 @@ class AudioStreamService : Service() {
         val minBufSize = AudioRecord.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT
         )
+        if (minBufSize <= 0) {
+            reportError("Unsupported audio format for this device (minBufSize=$minBufSize)")
+            return
+        }
 
-        audioRecord = AudioRecord.Builder()
+        val record = AudioRecord.Builder()
             .setAudioFormat(format)
             .setBufferSizeInBytes(minBufSize * 4)
             .setAudioPlaybackCaptureConfig(config)
             .build()
 
-        audioRecord?.startRecording()
+        if (record.state != AudioRecord.STATE_INITIALIZED) {
+            reportError("AudioRecord failed to initialize (state=${record.state}). Check RECORD_AUDIO permission was granted.")
+            record.release()
+            return
+        }
+
+        audioRecord = record
+        record.startRecording()
+
+        if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+            reportError("AudioRecord did not enter recording state")
+            return
+        }
 
         // ~20ms chunks at 48kHz/16-bit/stereo = 48000*0.02*2*2 bytes = 3840 bytes
         val chunkSize = 3840
         val buffer = ByteArray(chunkSize)
 
         captureJob = serviceScope.launch {
+            var framesSent = 0
             while (isActive) {
                 val read = audioRecord?.read(buffer, 0, chunkSize) ?: -1
                 if (read > 0) {
@@ -148,6 +184,12 @@ class AudioStreamService : Service() {
                             clients.remove(client)
                         }
                     }
+                    framesSent++
+                } else if (read < 0) {
+                    // Negative return values from AudioRecord.read are error codes
+                    // (ERROR_INVALID_OPERATION, ERROR_BAD_VALUE, ERROR_DEAD_OBJECT, etc.)
+                    reportError("AudioRecord.read returned error code $read")
+                    break
                 }
             }
         }
