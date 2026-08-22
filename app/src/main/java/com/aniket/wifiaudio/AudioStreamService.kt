@@ -13,6 +13,7 @@ import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import io.ktor.http.*
 import io.ktor.server.application.*
@@ -34,6 +35,7 @@ import java.util.concurrent.CopyOnWriteArraySet
 class AudioStreamService : Service() {
 
     companion object {
+        private const val TAG = "AudioStreamService"
         private const val CHANNEL_ID = "audio_stream_channel"
         private const val NOTIF_ID = 1
         private const val SAMPLE_RATE = 48000
@@ -63,13 +65,31 @@ class AudioStreamService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIF_ID, buildNotification())
 
+        // Start the web server unconditionally first, so the join link always comes up
+        // even if audio capture setup below fails for some reason.
+        try {
+            startServer()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start embedded server", e)
+        }
+
         val resultCode = intent?.getIntExtra("resultCode", -1) ?: -1
         val data = intent?.getParcelableExtra<Intent>("data")
         if (resultCode != -1 && data != null) {
             val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             mediaProjection = mgr.getMediaProjection(resultCode, data)
-            startCapture()
-            startServer()
+            // Required since Android 12 (API 31): MediaProjection must have a registered
+            // callback before it can be used to capture audio, or capture setup throws.
+            mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    Log.i(TAG, "MediaProjection stopped")
+                }
+            }, null)
+            try {
+                startCapture()
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start audio capture", e)
+            }
         }
         return START_NOT_STICKY
     }
