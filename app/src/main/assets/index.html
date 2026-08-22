@@ -9,6 +9,7 @@
   button { font-size:18px; padding:12px 24px; border-radius:8px; border:none; background:#1565C0; color:white; }
   input[type=range] { width: 80%; }
   #status { margin-top: 20px; color: #9ad; }
+  #status.error { color: #f88; }
 </style>
 </head>
 <body>
@@ -27,13 +28,26 @@ const slider = document.getElementById('latencySlider');
 const latencyLabel = document.getElementById('latencyLabel');
 
 let audioCtx, workletNode, socket;
+let usingFallback = false;
+let fallbackQueue = [];
+let fallbackStarted = false;
+let fallbackTargetSamples = 0;
+
 let targetLatencyMs = parseInt(slider.value, 10);
+
+function setStatus(text, isError) {
+  statusEl.textContent = text;
+  statusEl.classList.toggle('error', !!isError);
+}
 
 slider.addEventListener('input', () => {
   targetLatencyMs = parseInt(slider.value, 10);
   latencyLabel.textContent = targetLatencyMs;
   if (workletNode) {
     workletNode.port.postMessage({ type: 'setLatency', value: targetLatencyMs });
+  }
+  if (usingFallback && audioCtx) {
+    fallbackTargetSamples = Math.floor(audioCtx.sampleRate * (targetLatencyMs / 1000));
   }
 });
 
@@ -80,8 +94,7 @@ class JitterBufferProcessor extends AudioWorkletProcessor {
 registerProcessor('jitter-buffer-processor', JitterBufferProcessor);
 `;
 
-async function start() {
-  audioCtx = new AudioContext({ sampleRate: 48000 });
+async function setupAudioWorkletPath() {
   const blob = new Blob([workletCode], { type: 'application/javascript' });
   const url = URL.createObjectURL(blob);
   await audioCtx.audioWorklet.addModule(url);
@@ -91,24 +104,92 @@ async function start() {
   });
   workletNode.connect(audioCtx.destination);
   workletNode.port.postMessage({ type: 'setLatency', value: targetLatencyMs });
+}
 
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  socket = new WebSocket(`${proto}://${location.host}/stream`);
-  socket.binaryType = 'arraybuffer';
+// Fallback path for browsers that won't grant AudioWorklet on a non-HTTPS
+// LAN address. ScriptProcessorNode is deprecated but doesn't require a
+// secure context, so it works over plain http://<lan-ip>:port.
+function setupScriptProcessorPath() {
+  usingFallback = true;
+  fallbackTargetSamples = Math.floor(audioCtx.sampleRate * (targetLatencyMs / 1000));
+  const bufferSize = 4096;
+  const node = audioCtx.createScriptProcessor(bufferSize, 0, 2);
+  node.onaudioprocess = (e) => {
+    const left = e.outputBuffer.getChannelData(0);
+    const right = e.outputBuffer.getChannelData(1);
 
-  socket.onopen = () => { statusEl.textContent = 'Connected — buffering...'; };
-  socket.onclose = () => { statusEl.textContent = 'Disconnected'; };
-  socket.onerror = () => { statusEl.textContent = 'Connection error'; };
-
-  socket.onmessage = (event) => {
-    const view = new Int16Array(event.data);
-    const samples = new Float32Array(view.length);
-    for (let i = 0; i < view.length; i++) {
-      samples[i] = view[i] / 32768;
+    if (!fallbackStarted) {
+      if (fallbackQueue.length < fallbackTargetSamples * 2) {
+        left.fill(0); right.fill(0);
+        return;
+      }
+      fallbackStarted = true;
     }
-    workletNode.port.postMessage({ type: 'push', samples: Array.from(samples) });
-    statusEl.textContent = 'Streaming';
+
+    for (let i = 0; i < left.length; i++) {
+      if (fallbackQueue.length >= 2) {
+        left[i] = fallbackQueue.shift();
+        right[i] = fallbackQueue.shift();
+      } else {
+        left[i] = 0; right[i] = 0;
+        fallbackStarted = false;
+      }
+    }
   };
+  node.connect(audioCtx.destination);
+  workletNode = { port: { postMessage: () => {} } };
+}
+
+function pushSamples(samples) {
+  if (usingFallback) {
+    for (let i = 0; i < samples.length; i++) fallbackQueue.push(samples[i]);
+    const maxLen = fallbackTargetSamples * 6;
+    if (fallbackQueue.length > maxLen) {
+      fallbackQueue.splice(0, fallbackQueue.length - maxLen);
+    }
+  } else {
+    workletNode.port.postMessage({ type: 'push', samples: Array.from(samples) });
+  }
+}
+
+async function start() {
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+
+    if (audioCtx.audioWorklet) {
+      try {
+        await setupAudioWorkletPath();
+      } catch (workletErr) {
+        console.warn('AudioWorklet failed, falling back:', workletErr);
+        setupScriptProcessorPath();
+      }
+    } else {
+      setupScriptProcessorPath();
+    }
+
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    socket = new WebSocket(`${proto}://${location.host}/stream`);
+    socket.binaryType = 'arraybuffer';
+
+    socket.onopen = () => { setStatus('Connected — buffering...'); };
+    socket.onclose = () => { setStatus('Disconnected'); };
+    socket.onerror = () => { setStatus('Connection error — check the app is still streaming', true); };
+
+    socket.onmessage = (event) => {
+      const view = new Int16Array(event.data);
+      const samples = new Float32Array(view.length);
+      for (let i = 0; i < view.length; i++) {
+        samples[i] = view[i] / 32768;
+      }
+      pushSamples(samples);
+      setStatus('Streaming' + (usingFallback ? ' (compatibility mode)' : ''));
+    };
+  } catch (err) {
+    console.error('Failed to start playback:', err);
+    setStatus('Could not start audio: ' + err.message, true);
+    startBtn.disabled = false;
+    startBtn.textContent = 'Tap to Start Listening';
+  }
 }
 
 startBtn.addEventListener('click', () => {
