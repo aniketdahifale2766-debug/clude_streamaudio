@@ -10,6 +10,12 @@
   input[type=range] { width: 80%; }
   #status { margin-top: 20px; color: #9ad; }
   #status.error { color: #f88; }
+  #bufferedMs { margin-top: 8px; color: #888; font-size: 13px; }
+  .presets { margin-top: 12px; }
+  .presets button {
+    font-size: 14px; padding: 6px 14px; margin: 0 4px; background: #333; border-radius: 20px;
+  }
+  .presets button.active { background: #1565C0; }
 </style>
 </head>
 <body>
@@ -18,7 +24,14 @@
   <div id="status">Not connected</div>
   <div style="margin-top:30px;">
     <label>Latency: <span id="latencyLabel">200</span> ms</label><br/>
-    <input type="range" id="latencySlider" min="80" max="1000" value="200" />
+    <input type="range" id="latencySlider" min="80" max="1000" step="10" value="200" />
+    <div class="presets">
+      <button type="button" data-ms="80">80</button>
+      <button type="button" data-ms="150">150</button>
+      <button type="button" data-ms="300">300</button>
+      <button type="button" data-ms="600">600</button>
+    </div>
+    <div id="bufferedMs">actual buffered: — ms</div>
   </div>
 
 <script>
@@ -26,28 +39,50 @@ const startBtn = document.getElementById('startBtn');
 const statusEl = document.getElementById('status');
 const slider = document.getElementById('latencySlider');
 const latencyLabel = document.getElementById('latencyLabel');
+const bufferedMsEl = document.getElementById('bufferedMs');
+const presetButtons = document.querySelectorAll('.presets button');
 
 let audioCtx, workletNode, socket;
 let usingFallback = false;
 let fallbackRing = null;
 let targetLatencyMs = parseInt(slider.value, 10);
+let lastReportedBufferedMs = null; // updated via periodic postMessage from the worklet
 
 function setStatus(text, isError) {
   statusEl.textContent = text;
   statusEl.classList.toggle('error', !!isError);
 }
 
-slider.addEventListener('input', () => {
-  targetLatencyMs = parseInt(slider.value, 10);
-  latencyLabel.textContent = targetLatencyMs;
+function applyLatency(ms) {
+  targetLatencyMs = ms;
+  slider.value = ms;
+  latencyLabel.textContent = ms;
+  presetButtons.forEach(b => b.classList.toggle('active', parseInt(b.dataset.ms, 10) === ms));
   if (workletNode) {
-    workletNode.port.postMessage({ type: 'setLatency', value: targetLatencyMs });
+    workletNode.port.postMessage({ type: 'setLatency', value: ms });
   }
   if (usingFallback && fallbackRing && audioCtx) {
-    fallbackRing.targetSamples = Math.floor(audioCtx.sampleRate * (targetLatencyMs / 1000) * 2);
+    fallbackRing.targetSamples = Math.floor(audioCtx.sampleRate * (ms / 1000) * 2);
     fallbackRing.trimTo(fallbackRing.targetSamples);
   }
+}
+
+slider.addEventListener('input', () => applyLatency(parseInt(slider.value, 10)));
+presetButtons.forEach(btn => {
+  btn.addEventListener('click', () => applyLatency(parseInt(btn.dataset.ms, 10)));
 });
+
+// Poll the fallback ring buffer's actual occupancy (main thread, cheap) so the
+// person can see real buffered latency, not just the target they requested.
+setInterval(() => {
+  if (usingFallback && fallbackRing && audioCtx) {
+    const ms = Math.round((fallbackRing.available / 2) / audioCtx.sampleRate * 1000);
+    lastReportedBufferedMs = ms;
+  }
+  if (lastReportedBufferedMs !== null) {
+    bufferedMsEl.textContent = `actual buffered: ${lastReportedBufferedMs} ms`;
+  }
+}, 500);
 
 // Fixed-size ring buffer: O(1) read/write, no array shifting, no GC churn.
 // Old data is silently overwritten if the writer runs far ahead of the reader.
@@ -130,6 +165,7 @@ class JitterBufferProcessor extends AudioWorkletProcessor {
     this.ring = new RingBuffer(48000 * 2 * 2);
     this.targetSamples = Math.floor(sampleRate * 0.2 * 2);
     this.started = false;
+    this.framesSinceReport = 0;
     this.port.onmessage = (e) => {
       if (e.data.type === 'push') {
         this.ring.write(e.data.samples);
@@ -164,6 +200,15 @@ class JitterBufferProcessor extends AudioWorkletProcessor {
         this.started = false;
       }
     }
+
+    // Report actual buffered ms back to the main thread a few times a second
+    // so the UI can show real occupancy, not just the requested target.
+    this.framesSinceReport += left.length;
+    if (this.framesSinceReport >= sampleRate / 4) {
+      this.framesSinceReport = 0;
+      const bufferedMs = Math.round((this.ring.available / 2) / sampleRate * 1000);
+      this.port.postMessage({ type: 'bufferedMs', value: bufferedMs });
+    }
     return true;
   }
 }
@@ -180,6 +225,11 @@ async function setupAudioWorkletPath() {
   });
   workletNode.connect(audioCtx.destination);
   workletNode.port.postMessage({ type: 'setLatency', value: targetLatencyMs });
+  workletNode.port.onmessage = (e) => {
+    if (e.data.type === 'bufferedMs') {
+      lastReportedBufferedMs = e.data.value;
+    }
+  };
 }
 
 // Fallback path for browsers that won't grant AudioWorklet on a non-HTTPS
