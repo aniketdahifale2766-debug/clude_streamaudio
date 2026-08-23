@@ -45,6 +45,7 @@ slider.addEventListener('input', () => {
   }
   if (usingFallback && fallbackRing && audioCtx) {
     fallbackRing.targetSamples = Math.floor(audioCtx.sampleRate * (targetLatencyMs / 1000) * 2);
+    fallbackRing.trimTo(fallbackRing.targetSamples);
   }
 });
 
@@ -76,6 +77,14 @@ class RingBuffer {
     this.available--;
     return v;
   }
+  // Immediately drop the oldest samples down to maxAvailable, so a latency
+  // decrease takes effect right away instead of waiting for a natural underrun.
+  trimTo(maxAvailable) {
+    while (this.available > maxAvailable) {
+      this.readIdx = (this.readIdx + 1) % this.capacity;
+      this.available--;
+    }
+  }
 }
 
 // AudioWorklet path (secure contexts only — HTTPS or localhost)
@@ -106,6 +115,12 @@ class RingBuffer {
     this.available--;
     return v;
   }
+  trimTo(maxAvailable) {
+    while (this.available > maxAvailable) {
+      this.readIdx = (this.readIdx + 1) % this.capacity;
+      this.available--;
+    }
+  }
 }
 
 class JitterBufferProcessor extends AudioWorkletProcessor {
@@ -120,6 +135,10 @@ class JitterBufferProcessor extends AudioWorkletProcessor {
         this.ring.write(e.data.samples);
       } else if (e.data.type === 'setLatency') {
         this.targetSamples = Math.floor(sampleRate * (e.data.value / 1000) * 2);
+        // Apply the new target immediately instead of only at the next
+        // buffering phase, so the slider works live on a stream that's
+        // already playing (not just at the moment it starts).
+        this.ring.trimTo(this.targetSamples);
       }
     };
   }
