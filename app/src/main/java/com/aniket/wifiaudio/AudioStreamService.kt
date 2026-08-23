@@ -31,6 +31,10 @@ import java.util.concurrent.CopyOnWriteArraySet
 /**
  * Captures device system audio via MediaProjection + AudioPlaybackCaptureConfiguration
  * and broadcasts raw PCM frames to any connected WebSocket client on the local network.
+ *
+ * Live status is pushed into the persistent notification (not just broadcast to the
+ * activity), so it's visible in the notification shade no matter which app/screen
+ * you're currently on — you don't have to stay on MainActivity to see what's happening.
  */
 class AudioStreamService : Service() {
 
@@ -40,6 +44,10 @@ class AudioStreamService : Service() {
         private const val NOTIF_ID = 1
         private const val SAMPLE_RATE = 48000
         private const val PORT = 8080
+
+        // Bump this string on every change that gets pushed, so it's obvious from the
+        // notification/UI whether you're actually running the build you think you are.
+        const val BUILD_STAMP = "build-4-notif-status"
 
         const val ACTION_ERROR = "com.aniket.wifiaudio.ACTION_ERROR"
         const val ACTION_STATUS = "com.aniket.wifiaudio.ACTION_STATUS"
@@ -64,16 +72,19 @@ class AudioStreamService : Service() {
     private var audioRecord: AudioRecord? = null
     private val clients = CopyOnWriteArraySet<DefaultWebSocketServerSession>()
     private var captureJob: Job? = null
+    private lateinit var notificationManager: NotificationManager
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIF_ID, buildNotification())
+        notificationManager = getSystemService(NotificationManager::class.java)
+        startForeground(NOTIF_ID, buildNotification("Starting… ($BUILD_STAMP)"))
 
         // Start the web server unconditionally first, so the join link always comes up
         // even if audio capture setup below fails for some reason.
         try {
             startServer()
+            updateNotification("Server up on port $PORT ($BUILD_STAMP)")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start embedded server", e)
             reportError("Server failed to start: ${e.message}")
@@ -97,6 +108,8 @@ class AudioStreamService : Service() {
                 Log.e(TAG, "Failed to start audio capture", e)
                 reportError("Audio capture failed: ${e.javaClass.simpleName}: ${e.message}")
             }
+        } else {
+            reportError("No screen-capture permission result received (resultCode=$resultCode)")
         }
         return START_NOT_STICKY
     }
@@ -112,6 +125,8 @@ class AudioStreamService : Service() {
     }
 
     private fun reportError(message: String) {
+        Log.e(TAG, message)
+        updateNotification("ERROR: $message")
         val intent = Intent(ACTION_ERROR).apply {
             putExtra(EXTRA_ERROR_MESSAGE, message)
             setPackage(packageName)
@@ -120,11 +135,16 @@ class AudioStreamService : Service() {
     }
 
     private fun reportStatus(message: String) {
+        updateNotification(message)
         val intent = Intent(ACTION_STATUS).apply {
             putExtra(EXTRA_STATUS_MESSAGE, message)
             setPackage(packageName)
         }
         sendBroadcast(intent)
+    }
+
+    private fun updateNotification(text: String) {
+        notificationManager.notify(NOTIF_ID, buildNotification(text))
     }
 
     private fun startCapture() {
@@ -177,6 +197,8 @@ class AudioStreamService : Service() {
             return
         }
 
+        reportStatus("Capture started, waiting for audio… ($BUILD_STAMP)")
+
         // ~20ms chunks at 48kHz/16-bit/stereo = 48000*0.02*2*2 bytes = 3840 bytes
         val chunkSize = 3840
         val buffer = ByteArray(chunkSize)
@@ -218,8 +240,7 @@ class AudioStreamService : Service() {
                 val now = System.currentTimeMillis()
                 if (now - lastReportAt > 2000) {
                     reportStatus(
-                        "Capture running: framesRead=$framesRead, sentToClients=$framesSentToClients, " +
-                            "nonSilent=$nonSilentFrames, connectedClients=${clients.size}"
+                        "reads=$framesRead sent=$framesSentToClients nonSilent=$nonSilentFrames clients=${clients.size}"
                     )
                     lastReportAt = now
                 }
@@ -242,19 +263,21 @@ class AudioStreamService : Service() {
                 }
                 webSocket("/stream") {
                     clients.add(this)
+                    reportStatus("Client connected, total=${clients.size}")
                     try {
                         for (frame in incoming) {
                             // client -> server messages not used, just keep connection open
                         }
                     } finally {
                         clients.remove(this)
+                        reportStatus("Client disconnected, total=${clients.size}")
                     }
                 }
             }
         }.start(wait = false)
     }
 
-    private fun buildNotification(): Notification {
+    private fun buildNotification(text: String): Notification {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID, "Audio Streaming", NotificationManager.IMPORTANCE_LOW
@@ -264,8 +287,10 @@ class AudioStreamService : Service() {
         }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("WiFi Audio Stream")
-            .setContentText("Streaming system audio on your local network")
+            .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setOngoing(true)
             .build()
     }
 }
