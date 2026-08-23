@@ -43,8 +43,16 @@ class MainActivity : AppCompatActivity() {
     // Service reports real capture/server errors here instead of failing silently.
     private val errorReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            val message = intent?.getStringExtra(AudioStreamService.EXTRA_ERROR_MESSAGE) ?: "Unknown error"
-            binding.statusText.text = "Error: $message"
+            when (intent?.action) {
+                AudioStreamService.ACTION_ERROR -> {
+                    val message = intent.getStringExtra(AudioStreamService.EXTRA_ERROR_MESSAGE) ?: "Unknown error"
+                    binding.statusText.text = "Error: $message"
+                }
+                AudioStreamService.ACTION_STATUS -> {
+                    val message = intent.getStringExtra(AudioStreamService.EXTRA_STATUS_MESSAGE) ?: ""
+                    binding.statusText.text = message
+                }
+            }
         }
     }
 
@@ -72,7 +80,10 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
-        val filter = IntentFilter(AudioStreamService.ACTION_ERROR)
+        val filter = IntentFilter().apply {
+            addAction(AudioStreamService.ACTION_ERROR)
+            addAction(AudioStreamService.ACTION_STATUS)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(errorReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {

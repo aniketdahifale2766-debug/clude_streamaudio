@@ -42,7 +42,9 @@ class AudioStreamService : Service() {
         private const val PORT = 8080
 
         const val ACTION_ERROR = "com.aniket.wifiaudio.ACTION_ERROR"
+        const val ACTION_STATUS = "com.aniket.wifiaudio.ACTION_STATUS"
         const val EXTRA_ERROR_MESSAGE = "error_message"
+        const val EXTRA_STATUS_MESSAGE = "status_message"
 
         fun start(context: Context, resultCode: Int, data: Intent) {
             val intent = Intent(context, AudioStreamService::class.java)
@@ -117,6 +119,14 @@ class AudioStreamService : Service() {
         sendBroadcast(intent)
     }
 
+    private fun reportStatus(message: String) {
+        val intent = Intent(ACTION_STATUS).apply {
+            putExtra(EXTRA_STATUS_MESSAGE, message)
+            setPackage(packageName)
+        }
+        sendBroadcast(intent)
+    }
+
     private fun startCapture() {
         val projection = mediaProjection ?: run {
             reportError("No MediaProjection available")
@@ -172,24 +182,46 @@ class AudioStreamService : Service() {
         val buffer = ByteArray(chunkSize)
 
         captureJob = serviceScope.launch {
-            var framesSent = 0
+            var framesRead = 0
+            var framesSentToClients = 0
+            var nonSilentFrames = 0
+            var lastReportAt = System.currentTimeMillis()
+
             while (isActive) {
                 val read = audioRecord?.read(buffer, 0, chunkSize) ?: -1
                 if (read > 0) {
+                    framesRead++
                     val frame = buffer.copyOf(read)
+                    // Track whether we're actually capturing sound vs. silence, so we can
+                    // tell "pipeline broken" apart from "nothing audible is playing right now".
+                    var isSilent = true
+                    for (b in frame) {
+                        if (b.toInt() != 0) { isSilent = false; break }
+                    }
+                    if (!isSilent) nonSilentFrames++
+
                     for (client in clients) {
                         try {
                             client.send(Frame.Binary(true, frame))
+                            framesSentToClients++
                         } catch (e: Exception) {
                             clients.remove(client)
                         }
                     }
-                    framesSent++
                 } else if (read < 0) {
                     // Negative return values from AudioRecord.read are error codes
                     // (ERROR_INVALID_OPERATION, ERROR_BAD_VALUE, ERROR_DEAD_OBJECT, etc.)
                     reportError("AudioRecord.read returned error code $read")
                     break
+                }
+
+                val now = System.currentTimeMillis()
+                if (now - lastReportAt > 2000) {
+                    reportStatus(
+                        "Capture running: framesRead=$framesRead, sentToClients=$framesSentToClients, " +
+                            "nonSilent=$nonSilentFrames, connectedClients=${clients.size}"
+                    )
+                    lastReportAt = now
                 }
             }
         }
