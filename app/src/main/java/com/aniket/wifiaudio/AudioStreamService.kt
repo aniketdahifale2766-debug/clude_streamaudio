@@ -26,16 +26,18 @@ import io.ktor.server.routing.*
 import io.ktor.server.websocket.*
 import io.ktor.websocket.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import java.time.Duration
 import java.util.concurrent.CopyOnWriteArraySet
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Captures device system audio via MediaProjection + AudioPlaybackCaptureConfiguration
  * and broadcasts raw PCM frames to any connected WebSocket client on the local network.
  *
- * Live status is pushed into the persistent notification (not just broadcast to the
- * activity), so it's visible in the notification shade no matter which app/screen
- * you're currently on — you don't have to stay on MainActivity to see what's happening.
+ * Each client gets its own bounded, non-blocking outgoing queue and sender coroutine,
+ * decoupled from the audio-capture loop. A slow/congested client can only ever drop
+ * its own frames — it can never stall capture or delivery to other listeners.
  */
 class AudioStreamService : Service() {
 
@@ -48,7 +50,7 @@ class AudioStreamService : Service() {
 
         // Bump this string on every change that gets pushed, so it's obvious from the
         // notification/UI whether you're actually running the build you think you are.
-        const val BUILD_STAMP = "build-5-resultcode-fix"
+        const val BUILD_STAMP = "build-6-per-client-queues"
 
         const val ACTION_ERROR = "com.aniket.wifiaudio.ACTION_ERROR"
         const val ACTION_STATUS = "com.aniket.wifiaudio.ACTION_STATUS"
@@ -67,11 +69,45 @@ class AudioStreamService : Service() {
         }
     }
 
+    /** One per connected WebSocket client: its own queue + sender coroutine. */
+    private class ClientConnection(
+        val session: DefaultWebSocketServerSession,
+        val scope: CoroutineScope
+    ) {
+        // Small bounded queue: at ~20ms/frame, 25 frames = ~500ms of slack before
+        // this specific client starts dropping frames. Capture and other clients
+        // are never affected by that.
+        val queue = Channel<ByteArray>(capacity = 25)
+        val dropped = AtomicInteger(0)
+        val sent = AtomicInteger(0)
+
+        val senderJob: Job = scope.launch {
+            for (frame in queue) {
+                try {
+                    session.send(Frame.Binary(true, frame))
+                    sent.incrementAndGet()
+                } catch (e: Exception) {
+                    break
+                }
+            }
+        }
+
+        fun offer(frame: ByteArray) {
+            val result = queue.trySend(frame)
+            if (!result.isSuccess) dropped.incrementAndGet()
+        }
+
+        fun close() {
+            senderJob.cancel()
+            queue.close()
+        }
+    }
+
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var server: ApplicationEngine? = null
     private var mediaProjection: MediaProjection? = null
     private var audioRecord: AudioRecord? = null
-    private val clients = CopyOnWriteArraySet<DefaultWebSocketServerSession>()
+    private val clients = CopyOnWriteArraySet<ClientConnection>()
     private var captureJob: Job? = null
     private lateinit var notificationManager: NotificationManager
 
@@ -81,8 +117,6 @@ class AudioStreamService : Service() {
         notificationManager = getSystemService(NotificationManager::class.java)
         startForeground(NOTIF_ID, buildNotification("Starting… ($BUILD_STAMP)"))
 
-        // Start the web server unconditionally first, so the join link always comes up
-        // even if audio capture setup below fails for some reason.
         try {
             startServer()
             updateNotification("Server up on port $PORT ($BUILD_STAMP)")
@@ -96,8 +130,6 @@ class AudioStreamService : Service() {
         if (resultCode == Activity.RESULT_OK && data != null) {
             val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             mediaProjection = mgr.getMediaProjection(resultCode, data)
-            // Required since Android 12 (API 31): MediaProjection must have a registered
-            // callback before it can be used to capture audio, or capture setup throws.
             mediaProjection?.registerCallback(object : MediaProjection.Callback() {
                 override fun onStop() {
                     Log.i(TAG, "MediaProjection stopped")
@@ -121,6 +153,8 @@ class AudioStreamService : Service() {
         audioRecord?.stop()
         audioRecord?.release()
         mediaProjection?.stop()
+        clients.forEach { it.close() }
+        clients.clear()
         server?.stop(1000, 2000)
         serviceScope.cancel()
     }
@@ -206,7 +240,6 @@ class AudioStreamService : Service() {
 
         captureJob = serviceScope.launch {
             var framesRead = 0
-            var framesSentToClients = 0
             var nonSilentFrames = 0
             var lastReportAt = System.currentTimeMillis()
 
@@ -215,33 +248,28 @@ class AudioStreamService : Service() {
                 if (read > 0) {
                     framesRead++
                     val frame = buffer.copyOf(read)
-                    // Track whether we're actually capturing sound vs. silence, so we can
-                    // tell "pipeline broken" apart from "nothing audible is playing right now".
                     var isSilent = true
                     for (b in frame) {
                         if (b.toInt() != 0) { isSilent = false; break }
                     }
                     if (!isSilent) nonSilentFrames++
 
+                    // Non-blocking hand-off: each client has its own queue, so one
+                    // slow client can never stall this loop or any other client.
                     for (client in clients) {
-                        try {
-                            client.send(Frame.Binary(true, frame))
-                            framesSentToClients++
-                        } catch (e: Exception) {
-                            clients.remove(client)
-                        }
+                        client.offer(frame)
                     }
                 } else if (read < 0) {
-                    // Negative return values from AudioRecord.read are error codes
-                    // (ERROR_INVALID_OPERATION, ERROR_BAD_VALUE, ERROR_DEAD_OBJECT, etc.)
                     reportError("AudioRecord.read returned error code $read")
                     break
                 }
 
                 val now = System.currentTimeMillis()
                 if (now - lastReportAt > 2000) {
+                    val totalSent = clients.sumOf { it.sent.get() }
+                    val totalDropped = clients.sumOf { it.dropped.get() }
                     reportStatus(
-                        "reads=$framesRead sent=$framesSentToClients nonSilent=$nonSilentFrames clients=${clients.size}"
+                        "reads=$framesRead sent=$totalSent dropped=$totalDropped nonSilent=$nonSilentFrames clients=${clients.size}"
                     )
                     lastReportAt = now
                 }
@@ -263,14 +291,16 @@ class AudioStreamService : Service() {
                     )
                 }
                 webSocket("/stream") {
-                    clients.add(this)
+                    val client = ClientConnection(this, serviceScope)
+                    clients.add(client)
                     reportStatus("Client connected, total=${clients.size}")
                     try {
                         for (frame in incoming) {
                             // client -> server messages not used, just keep connection open
                         }
                     } finally {
-                        clients.remove(this)
+                        client.close()
+                        clients.remove(client)
                         reportStatus("Client disconnected, total=${clients.size}")
                     }
                 }
