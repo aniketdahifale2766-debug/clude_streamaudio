@@ -21,7 +21,12 @@ class UsbDualAudioActivity : AppCompatActivity() {
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
             UsbDualAudioService.startHost(this, result.resultCode, result.data!!)
             binding.status.text = "Host started — connect the other phone by USB-C"
-            binding.hostIp.text = "Host addresses: ${UsbNetworkUtil.activeIpv4Addresses().joinToString() }"
+            val usbIps = UsbNetworkUtil.usbIpv4Addresses()
+            binding.hostIp.text = if (usbIps.isEmpty()) {
+                "USB IP not visible yet. Keep USB tethering enabled and check again."
+            } else {
+                "USB Host IP: ${usbIps.joinToString() }"
+            }
         } else {
             binding.status.text = "Audio capture permission cancelled"
         }
