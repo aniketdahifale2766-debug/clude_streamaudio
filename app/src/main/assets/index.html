@@ -29,10 +29,7 @@ const latencyLabel = document.getElementById('latencyLabel');
 
 let audioCtx, workletNode, socket;
 let usingFallback = false;
-let fallbackQueue = [];
-let fallbackStarted = false;
-let fallbackTargetSamples = 0;
-
+let fallbackRing = null;
 let targetLatencyMs = parseInt(slider.value, 10);
 
 function setStatus(text, isError) {
@@ -46,23 +43,83 @@ slider.addEventListener('input', () => {
   if (workletNode) {
     workletNode.port.postMessage({ type: 'setLatency', value: targetLatencyMs });
   }
-  if (usingFallback && audioCtx) {
-    fallbackTargetSamples = Math.floor(audioCtx.sampleRate * (targetLatencyMs / 1000));
+  if (usingFallback && fallbackRing && audioCtx) {
+    fallbackRing.targetSamples = Math.floor(audioCtx.sampleRate * (targetLatencyMs / 1000) * 2);
   }
 });
 
+// Fixed-size ring buffer: O(1) read/write, no array shifting, no GC churn.
+// Old data is silently overwritten if the writer runs far ahead of the reader.
+class RingBuffer {
+  constructor(capacitySamples) {
+    this.capacity = capacitySamples;
+    this.buf = new Float32Array(capacitySamples);
+    this.writeIdx = 0;
+    this.readIdx = 0;
+    this.available = 0;
+  }
+  write(samples) {
+    for (let i = 0; i < samples.length; i++) {
+      this.buf[this.writeIdx] = samples[i];
+      this.writeIdx = (this.writeIdx + 1) % this.capacity;
+      if (this.available < this.capacity) {
+        this.available++;
+      } else {
+        this.readIdx = (this.readIdx + 1) % this.capacity;
+      }
+    }
+  }
+  read() {
+    if (this.available <= 0) return 0;
+    const v = this.buf[this.readIdx];
+    this.readIdx = (this.readIdx + 1) % this.capacity;
+    this.available--;
+    return v;
+  }
+}
+
+// AudioWorklet path (secure contexts only — HTTPS or localhost)
 const workletCode = `
+class RingBuffer {
+  constructor(capacitySamples) {
+    this.capacity = capacitySamples;
+    this.buf = new Float32Array(capacitySamples);
+    this.writeIdx = 0;
+    this.readIdx = 0;
+    this.available = 0;
+  }
+  write(samples) {
+    for (let i = 0; i < samples.length; i++) {
+      this.buf[this.writeIdx] = samples[i];
+      this.writeIdx = (this.writeIdx + 1) % this.capacity;
+      if (this.available < this.capacity) {
+        this.available++;
+      } else {
+        this.readIdx = (this.readIdx + 1) % this.capacity;
+      }
+    }
+  }
+  read() {
+    if (this.available <= 0) return 0;
+    const v = this.buf[this.readIdx];
+    this.readIdx = (this.readIdx + 1) % this.capacity;
+    this.available--;
+    return v;
+  }
+}
+
 class JitterBufferProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.queue = [];
-    this.targetSamples = Math.floor(sampleRate * 0.2);
+    // Capacity generous enough for up to ~2s of stereo audio at 48kHz.
+    this.ring = new RingBuffer(48000 * 2 * 2);
+    this.targetSamples = Math.floor(sampleRate * 0.2 * 2);
     this.started = false;
     this.port.onmessage = (e) => {
       if (e.data.type === 'push') {
-        this.queue.push(...e.data.samples);
+        this.ring.write(e.data.samples);
       } else if (e.data.type === 'setLatency') {
-        this.targetSamples = Math.floor(sampleRate * (e.data.value / 1000));
+        this.targetSamples = Math.floor(sampleRate * (e.data.value / 1000) * 2);
       }
     };
   }
@@ -72,7 +129,7 @@ class JitterBufferProcessor extends AudioWorkletProcessor {
     const right = output[1] || output[0];
 
     if (!this.started) {
-      if (this.queue.length < this.targetSamples * 2) {
+      if (this.ring.available < this.targetSamples) {
         left.fill(0); right.fill(0);
         return true;
       }
@@ -80,9 +137,9 @@ class JitterBufferProcessor extends AudioWorkletProcessor {
     }
 
     for (let i = 0; i < left.length; i++) {
-      if (this.queue.length >= 2) {
-        left[i] = this.queue.shift();
-        right[i] = this.queue.shift();
+      if (this.ring.available >= 2) {
+        left[i] = this.ring.read();
+        right[i] = this.ring.read();
       } else {
         left[i] = 0; right[i] = 0;
         this.started = false;
@@ -111,28 +168,31 @@ async function setupAudioWorkletPath() {
 // secure context, so it works over plain http://<lan-ip>:port.
 function setupScriptProcessorPath() {
   usingFallback = true;
-  fallbackTargetSamples = Math.floor(audioCtx.sampleRate * (targetLatencyMs / 1000));
+  fallbackRing = new RingBuffer(48000 * 2 * 2);
+  fallbackRing.targetSamples = Math.floor(audioCtx.sampleRate * (targetLatencyMs / 1000) * 2);
+  let started = false;
+
   const bufferSize = 4096;
   const node = audioCtx.createScriptProcessor(bufferSize, 0, 2);
   node.onaudioprocess = (e) => {
     const left = e.outputBuffer.getChannelData(0);
     const right = e.outputBuffer.getChannelData(1);
 
-    if (!fallbackStarted) {
-      if (fallbackQueue.length < fallbackTargetSamples * 2) {
+    if (!started) {
+      if (fallbackRing.available < fallbackRing.targetSamples) {
         left.fill(0); right.fill(0);
         return;
       }
-      fallbackStarted = true;
+      started = true;
     }
 
     for (let i = 0; i < left.length; i++) {
-      if (fallbackQueue.length >= 2) {
-        left[i] = fallbackQueue.shift();
-        right[i] = fallbackQueue.shift();
+      if (fallbackRing.available >= 2) {
+        left[i] = fallbackRing.read();
+        right[i] = fallbackRing.read();
       } else {
         left[i] = 0; right[i] = 0;
-        fallbackStarted = false;
+        started = false;
       }
     }
   };
@@ -142,13 +202,11 @@ function setupScriptProcessorPath() {
 
 function pushSamples(samples) {
   if (usingFallback) {
-    for (let i = 0; i < samples.length; i++) fallbackQueue.push(samples[i]);
-    const maxLen = fallbackTargetSamples * 6;
-    if (fallbackQueue.length > maxLen) {
-      fallbackQueue.splice(0, fallbackQueue.length - maxLen);
-    }
+    fallbackRing.write(samples);
   } else {
-    workletNode.port.postMessage({ type: 'push', samples: Array.from(samples) });
+    // Transfer the underlying buffer instead of structured-cloning a plain
+    // array — zero-copy handoff to the audio-render thread, no GC pressure.
+    workletNode.port.postMessage({ type: 'push', samples }, [samples.buffer]);
   }
 }
 
