@@ -1,5 +1,6 @@
 package com.aniket.wifiaudio
 
+import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -47,7 +48,7 @@ class AudioStreamService : Service() {
 
         // Bump this string on every change that gets pushed, so it's obvious from the
         // notification/UI whether you're actually running the build you think you are.
-        const val BUILD_STAMP = "build-4-notif-status"
+        const val BUILD_STAMP = "build-5-resultcode-fix"
 
         const val ACTION_ERROR = "com.aniket.wifiaudio.ACTION_ERROR"
         const val ACTION_STATUS = "com.aniket.wifiaudio.ACTION_STATUS"
@@ -90,9 +91,9 @@ class AudioStreamService : Service() {
             reportError("Server failed to start: ${e.message}")
         }
 
-        val resultCode = intent?.getIntExtra("resultCode", -1) ?: -1
+        val resultCode = intent?.getIntExtra("resultCode", Int.MIN_VALUE) ?: Int.MIN_VALUE
         val data = intent?.getParcelableExtra<Intent>("data")
-        if (resultCode != -1 && data != null) {
+        if (resultCode == Activity.RESULT_OK && data != null) {
             val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             mediaProjection = mgr.getMediaProjection(resultCode, data)
             // Required since Android 12 (API 31): MediaProjection must have a registered
