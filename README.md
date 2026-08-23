@@ -1,34 +1,41 @@
-# WiFi Audio Stream
+# WiFi Audio Stream + USB-C Dual Audio
 
-Streams the device's system audio over local WiFi. Anyone on the same network opens
-`http://<phone-ip>:8080` in a browser and listens live, with a per-client latency slider.
+The original WiFi mode streams system audio over a local network. A new **USB-C Dual Audio** section has been added to the same APK.
 
-## How it works
-- `AudioStreamService.kt` — captures system audio via MediaProjection + AudioPlaybackCaptureConfiguration,
-  runs an embedded Ktor server, and pushes raw PCM frames to connected clients over a WebSocket (`/stream`).
-- `assets/index.html` — the web player. Uses an AudioWorklet with a jitter buffer; the slider
-  controls buffer size in real time.
-- `MainActivity.kt` — requests screen/audio capture permission and starts/stops the service, shows the join link.
+## USB-C Dual Audio
 
-## Push to your new repo
+The USB mode is designed for two Android phones connected by USB-C using Android USB tethering/RNDIS as the transport.
 
-```bash
-cd wifi-audio-stream
-git init
-git add .
-git commit -m "Initial scaffold: system audio capture + local WebSocket streaming"
-git branch -M main
-git remote add origin https://github.com/<your-username>/<your-repo>.git
-git push -u origin main
-```
+### Architecture
+- `UsbDualAudioActivity.kt` — Host/Client UI and pairing.
+- `UsbDualAudioService.kt` — Host capture, Client playback, TCP transport, clock synchronization and timestamped PCM frames.
+- `UsbAudioProtocol.kt` — framed TCP protocol with `SESSION_START`, `SYNC_REQUEST`, `SYNC_RESPONSE`, `AUDIO_FRAME`, `HEARTBEAT`, and `SESSION_STOP`.
+- `UsbNetworkUtil.kt` — detects likely USB/RNDIS interfaces and the USB-side default gateway.
 
-Once pushed, GitHub Actions (`.github/workflows/build.yml`) builds automatically and produces
-a **debug-signed APK** as a downloadable artifact on the Actions run (Actions tab → latest run →
-Artifacts → `app-debug-apk`).
+### Audio format
+- 48,000 Hz
+- Stereo
+- 16-bit PCM
+- 20 ms frames
+- 3,840 bytes per full audio frame
+- TCP with `TCP_NODELAY`
+- 150 ms timestamp look-ahead for synchronized presentation
 
-## Notes / next steps
-- This is a first-pass scaffold — build order per the earlier plan: (1) get capture → server → client
-  working end-to-end on one phone, (2) test from a second device, (3) tune the jitter buffer,
-  (4) add QR code + connection count to the UI, (5) add reconnect logic and wake-lock handling.
-- Debug APK is unsigned for release purposes — fine for sideloading/testing. Say the word when you
-  want a release keystore wired into the pipeline for a signed release APK.
+### Phone setup
+1. Connect the two phones with a USB-C data cable.
+2. On the Host phone, enable **USB tethering** if Android requires it.
+3. Open this APK and select **USB-C Dual Audio**.
+4. On Phone A select **HOST — Share Audio** and approve system-audio capture.
+5. On Phone B select **CLIENT — Play Synced Audio**. The app attempts to detect the USB gateway automatically; if needed, enter the Host USB IP shown on Phone A.
+6. Both phones should enter synchronized playback after the client fills its startup buffer.
+
+### Important limitation
+This is a synchronized playback implementation, not literal zero-latency audio. Android audio hardware, MediaProjection capture, USB tethering and `AudioTrack` each add processing/buffering. The timestamp/clock-sync design targets simultaneous presentation of the two outputs rather than eliminating absolute source-to-speaker latency. USB tethering/RNDIS support also varies by Android OEM and device.
+
+## Existing WiFi mode
+- `AudioStreamService.kt` captures system audio via MediaProjection + AudioPlaybackCaptureConfiguration and serves raw PCM over WebSocket.
+- `assets/index.html` is the browser AudioWorklet player with a jitter buffer.
+- `MainActivity.kt` controls the original WiFi mode and now also opens the USB-C Dual Audio section.
+
+## APK build
+GitHub Actions (`.github/workflows/build.yml`) builds a debug APK on pushes to `main` and uploads `app-debug-apk` as an artifact.
