@@ -48,6 +48,36 @@ let fallbackRing = null;
 let targetLatencyMs = parseInt(slider.value, 10);
 let lastReportedBufferedMs = null; // updated via periodic postMessage from the worklet
 
+// Single-instance guard: if this page is opened in multiple tabs on the same
+// device (easy to do by accident), each tab would otherwise play its own
+// audio simultaneously — same content, slightly offset — which sounds like
+// an echo. Only the most-recently-started tab is allowed to keep playing;
+// older tabs stop themselves the moment a newer one claims playback.
+const tabId = Math.random().toString(36).slice(2);
+const instanceChannel = ('BroadcastChannel' in window) ? new BroadcastChannel('wifi-audio-stream') : null;
+let stoppedByNewerTab = false;
+
+function stopPlayback(reason) {
+  if (socket) { try { socket.close(); } catch (e) {} socket = null; }
+  if (audioCtx) { try { audioCtx.close(); } catch (e) {} audioCtx = null; }
+  workletNode = null;
+  fallbackRing = null;
+  startBtn.disabled = false;
+  startBtn.textContent = 'Tap to Start Listening';
+  setStatus(reason);
+}
+
+if (instanceChannel) {
+  instanceChannel.onmessage = (e) => {
+    if (e.data && e.data.type === 'claim' && e.data.tabId !== tabId) {
+      if (socket || audioCtx) {
+        stoppedByNewerTab = true;
+        stopPlayback('Stopped — playing in another tab on this device');
+      }
+    }
+  };
+}
+
 function setStatus(text, isError) {
   statusEl.textContent = text;
   statusEl.classList.toggle('error', !!isError);
@@ -281,6 +311,10 @@ function pushSamples(samples) {
 
 async function start() {
   try {
+    if (instanceChannel) {
+      instanceChannel.postMessage({ type: 'claim', tabId });
+    }
+
     audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
 
     if (audioCtx.audioWorklet) {
