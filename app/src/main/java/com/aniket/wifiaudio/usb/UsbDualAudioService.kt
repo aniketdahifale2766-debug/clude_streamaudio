@@ -11,11 +11,12 @@ import android.media.AudioFormat
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.AudioTrack
-import android.media.MediaRecorder
 import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -60,7 +61,7 @@ class UsbDualAudioService : Service() {
                 putExtra(EXTRA_PROJECTION_RESULT, resultCode)
                 putExtra(EXTRA_PROJECTION_DATA, data)
             }
-            androidx.core.content.ContextCompat.startForegroundService(context, intent)
+            ContextCompat.startForegroundService(context, intent)
         }
 
         fun startClient(context: Context, host: String) {
@@ -68,7 +69,7 @@ class UsbDualAudioService : Service() {
                 putExtra(EXTRA_MODE, MODE_CLIENT)
                 putExtra(EXTRA_HOST, host)
             }
-            androidx.core.content.ContextCompat.startForegroundService(context, intent)
+            ContextCompat.startForegroundService(context, intent)
         }
 
         fun stop(context: Context) {
@@ -85,13 +86,11 @@ class UsbDualAudioService : Service() {
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
     private var projection: MediaProjection? = null
-    private var mode: String = MODE_HOST
-    private var hostAddress: String? = null
-    private var sequence = 0L
     private var running = false
-    private var clientOffsetNs = 0L
+    private var sequence = 0L
+    @Volatile private var clientOffsetNs = 0L
+    @Volatile private var haveClockSync = false
     private var clientPlaybackStarted = false
-    private var hostPlaybackStarted = false
 
     override fun onCreate() {
         super.onCreate()
@@ -101,9 +100,8 @@ class UsbDualAudioService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (running) return START_STICKY
-        mode = intent?.getStringExtra(EXTRA_MODE) ?: MODE_HOST
-        hostAddress = intent?.getStringExtra(EXTRA_HOST)
         running = true
+        val mode = intent?.getStringExtra(EXTRA_MODE) ?: MODE_HOST
         if (mode == MODE_HOST) {
             val resultCode = intent?.getIntExtra(EXTRA_PROJECTION_RESULT, -1) ?: -1
             val data = intent?.getParcelableExtra<Intent>(EXTRA_PROJECTION_DATA)
@@ -111,14 +109,15 @@ class UsbDualAudioService : Service() {
                 fail("Screen/audio capture permission is required for Host")
                 return START_NOT_STICKY
             }
-            projection = getSystemService(MediaProjectionManagerCompat::class.java)?.create(resultCode, data)
+            val manager = getSystemService(MediaProjectionManager::class.java)
+            projection = manager?.getMediaProjection(resultCode, data)
             if (projection == null) {
                 fail("Unable to create MediaProjection")
                 return START_NOT_STICKY
             }
             scope.launch { runHost() }
         } else {
-            scope.launch { runClient(hostAddress) }
+            scope.launch { runClient(intent?.getStringExtra(EXTRA_HOST)) }
         }
         return START_STICKY
     }
@@ -127,24 +126,20 @@ class UsbDualAudioService : Service() {
         try {
             update("Host: waiting for USB client on ${UsbAudioProtocol.PORT}")
             serverSocket = ServerSocket(UsbAudioProtocol.PORT)
-            socket = serverSocket!!.accept().apply {
-                tcpNoDelay = true
-                keepAlive = true
-            }
+            socket = serverSocket!!.accept().apply { tcpNoDelay = true; keepAlive = true }
             output = DataOutputStream(socket!!.getOutputStream())
             input = DataInputStream(socket!!.getInputStream())
             update("Host: client connected, synchronizing")
             sendSessionStart()
-            launchControlReaderHost()
-            prepareHostAudio()
-            startHostPlaybackAfterLookahead()
+            launchHostControlReader()
+            prepareAudioTrack()
             captureAndSend()
         } catch (t: Throwable) {
             if (running) fail("Host: ${t.message ?: t.javaClass.simpleName}")
         }
     }
 
-    private fun launchControlReaderHost() {
+    private fun launchHostControlReader() {
         scope.launch {
             try {
                 while (isActive && running) {
@@ -161,7 +156,7 @@ class UsbDualAudioService : Service() {
                                 UsbAudioProtocol.writeMessage(output!!, UsbAudioProtocol.SYNC_RESPONSE, response)
                             }
                         }
-                        UsbAudioProtocol.HEARTBEAT -> UsbAudioProtocol.writeMessage(output!!, UsbAudioProtocol.HEARTBEAT)
+                        UsbAudioProtocol.HEARTBEAT -> Unit
                         UsbAudioProtocol.SESSION_STOP -> stopSelf()
                     }
                 }
@@ -173,11 +168,15 @@ class UsbDualAudioService : Service() {
 
     private fun sendSessionStart() {
         val payload = ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN)
-            .putInt(SAMPLE_RATE).put( CHANNELS.toByte()).put(16.toByte()).putShort(FRAME_MS.toShort()).array()
+            .putInt(SAMPLE_RATE)
+            .put(CHANNELS.toByte())
+            .put(16.toByte())
+            .putShort(FRAME_MS.toShort())
+            .array()
         UsbAudioProtocol.writeMessage(output!!, UsbAudioProtocol.SESSION_START, payload)
     }
 
-    private fun prepareHostAudio() {
+    private fun prepareAudioTrack() {
         val format = AudioFormat.Builder()
             .setSampleRate(SAMPLE_RATE)
             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
@@ -190,11 +189,6 @@ class UsbDualAudioService : Service() {
             .setBufferSizeInBytes(maxOf(min, FRAME_BYTES * 4))
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
-        audioTrack!!.play()
-    }
-
-    private fun startHostPlaybackAfterLookahead() {
-        scheduler.schedule({ hostPlaybackStarted = true }, 150, TimeUnit.MILLISECONDS)
     }
 
     private fun captureAndSend() {
@@ -216,13 +210,17 @@ class UsbDualAudioService : Service() {
             .setAudioPlaybackCaptureConfig(captureConfig)
             .build()
         audioRecord!!.startRecording()
+        update("Host: capturing and timestamping 48kHz stereo PCM")
+
         val buffer = ByteArray(FRAME_BYTES)
-        update("Host: synchronized capture running")
+        var hostStartAt = 0L
         while (running) {
             val read = audioRecord!!.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
             if (read <= 0) continue
-            val frame = if (read == buffer.size) buffer.copyOf() else buffer.copyOf(read)
+            val frame = buffer.copyOf(read)
             val playbackTimestamp = System.nanoTime() + LOOKAHEAD_NS
+            if (hostStartAt == 0L) hostStartAt = playbackTimestamp
+
             val payload = ByteBuffer.allocate(4 + 8 + 2 + frame.size).order(ByteOrder.BIG_ENDIAN)
                 .putInt((sequence and 0xffffffffL).toInt())
                 .putLong(playbackTimestamp)
@@ -230,14 +228,19 @@ class UsbDualAudioService : Service() {
                 .put(frame)
                 .array()
             UsbAudioProtocol.writeMessage(output!!, UsbAudioProtocol.AUDIO_FRAME, payload)
-            if (hostPlaybackStarted) audioTrack?.write(frame, 0, frame.size, AudioTrack.WRITE_BLOCKING)
+
+            if (System.nanoTime() >= hostStartAt) {
+                audioTrack?.play()
+                audioTrack?.write(frame, 0, frame.size, AudioTrack.WRITE_BLOCKING)
+            }
             sequence++
         }
     }
 
     private suspend fun runClient(host: String?) {
         try {
-            val target = host ?: UsbNetworkUtil.defaultGateway(this) ?: throw IllegalStateException("USB host address not found")
+            val target = host ?: UsbNetworkUtil.defaultGateway(this)
+                ?: throw IllegalStateException("USB host address not found")
             update("Client: connecting to $target:${UsbAudioProtocol.PORT}")
             socket = Socket().apply {
                 tcpNoDelay = true
@@ -247,21 +250,21 @@ class UsbDualAudioService : Service() {
             output = DataOutputStream(socket!!.getOutputStream())
             input = DataInputStream(socket!!.getInputStream())
             update("Client: connected, synchronizing clock")
-            launchClientSyncLoop()
+            launchClientControlSender()
             receiveClientStream()
         } catch (t: Throwable) {
             if (running) fail("Client: ${t.message ?: t.javaClass.simpleName}")
         }
     }
 
-    private fun launchClientSyncLoop() {
+    private fun launchClientControlSender() {
         scope.launch {
             try {
                 repeat(8) {
                     val send = System.nanoTime()
                     val payload = ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN).putLong(send).array()
                     UsbAudioProtocol.writeMessage(output!!, UsbAudioProtocol.SYNC_REQUEST, payload)
-                    delay(250)
+                    delay(200)
                 }
             } catch (_: Throwable) { }
         }
@@ -275,8 +278,7 @@ class UsbDualAudioService : Service() {
 
     private fun receiveClientStream() {
         var configured = false
-        val jitter = ArrayDeque<ByteArray>()
-        var firstTimestamp = 0L
+        val pending = ArrayDeque<PendingFrame>()
         while (running) {
             val header = UsbAudioProtocol.readHeader(input!!)
             val payload = UsbAudioProtocol.readPayload(input!!, header.length)
@@ -288,43 +290,55 @@ class UsbDualAudioService : Service() {
                         update("Client: session ready, buffering")
                     }
                 }
-                UsbAudioProtocol.SYNC_RESPONSE -> {
-                    if (payload.size == 24) {
-                        val now = System.nanoTime()
-                        val bb = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
-                        val clientSend = bb.long
-                        val hostRecv = bb.long
-                        val hostSend = bb.long
-                        val rtt = (now - clientSend) - (hostSend - hostRecv)
-                        val offset = ((hostRecv - clientSend) + (hostSend - now)) / 2
-                        if (rtt > 0) clientOffsetNs = offset
-                    }
-                }
+                UsbAudioProtocol.SYNC_RESPONSE -> handleSyncResponse(payload)
                 UsbAudioProtocol.AUDIO_FRAME -> {
                     if (!configured || payload.size < 14) continue
                     val bb = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
-                    bb.int
+                    val sequenceNumber = bb.int
                     val timestamp = bb.long
                     bb.short
                     val pcm = ByteArray(bb.remaining())
                     bb.get(pcm)
-                    if (firstTimestamp == 0L) firstTimestamp = timestamp
-                    jitter.addLast(pcm)
-                    if (!clientPlaybackStarted) {
-                        val localTarget = timestamp - clientOffsetNs
+                    pending.addLast(PendingFrame(sequenceNumber, timestamp, pcm))
+                    if (!clientPlaybackStarted && haveClockSync && pending.size >= 3) {
+                        val first = pending.first()
+                        val localTarget = first.timestamp - clientOffsetNs
                         val waitNs = localTarget - System.nanoTime()
-                        if (waitNs > 0) Thread.sleep(waitNs / 1_000_000, (waitNs % 1_000_000).toInt())
+                        if (waitNs > 0) {
+                            try { Thread.sleep(waitNs / 1_000_000, (waitNs % 1_000_000).toInt()) } catch (_: InterruptedException) { }
+                        }
                         audioTrack?.play()
                         clientPlaybackStarted = true
                         update("Client: synchronized playback")
                     }
-                    while (jitter.size > 3) audioTrack?.write(jitter.removeFirst(), 0, jitter.firstOrNull()?.size ?: 0, AudioTrack.WRITE_BLOCKING)
-                    val last = jitter.removeFirstOrNull()
-                    if (last != null) audioTrack?.write(last, 0, last.size, AudioTrack.WRITE_BLOCKING)
+                    if (clientPlaybackStarted) {
+                        while (pending.isNotEmpty()) {
+                            val frame = pending.removeFirst()
+                            audioTrack?.write(frame.pcm, 0, frame.pcm.size, AudioTrack.WRITE_BLOCKING)
+                        }
+                    } else if (pending.size > 10) {
+                        pending.removeFirst()
+                    }
                 }
                 UsbAudioProtocol.HEARTBEAT -> Unit
                 UsbAudioProtocol.SESSION_STOP -> stopSelf()
             }
+        }
+    }
+
+    private fun handleSyncResponse(payload: ByteArray) {
+        if (payload.size != 24) return
+        val now = System.nanoTime()
+        val bb = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+        val clientSend = bb.long
+        val hostRecv = bb.long
+        val hostSend = bb.long
+        val rtt = (now - clientSend) - (hostSend - hostRecv)
+        if (rtt <= 0) return
+        val offset = ((hostRecv - clientSend) + (hostSend - now)) / 2
+        if (!haveClockSync || rtt < 5_000_000L) {
+            clientOffsetNs = offset
+            haveClockSync = true
         }
     }
 
@@ -345,10 +359,8 @@ class UsbDualAudioService : Service() {
     }
 
     private fun update(message: String) {
-        val intent = Intent(ACTION_STATUS).setPackage(packageName).putExtra(EXTRA_STATUS, message)
-        sendBroadcast(intent)
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(NOTIFICATION_ID, notification(message))
+        sendBroadcast(Intent(ACTION_STATUS).setPackage(packageName).putExtra(EXTRA_STATUS, message))
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(message))
     }
 
     private fun fail(message: String) {
@@ -356,13 +368,12 @@ class UsbDualAudioService : Service() {
         stopSelf()
     }
 
-    private fun notification(text: String): Notification =
-        NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("USB-C Dual Audio")
-            .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_media_play)
-            .setOngoing(true)
-            .build()
+    private fun notification(text: String): Notification = NotificationCompat.Builder(this, CHANNEL_ID)
+        .setContentTitle("USB-C Dual Audio")
+        .setContentText(text)
+        .setSmallIcon(android.R.drawable.ic_media_play)
+        .setOngoing(true)
+        .build()
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -375,13 +386,13 @@ class UsbDualAudioService : Service() {
     override fun onDestroy() {
         running = false
         try { output?.let { UsbAudioProtocol.writeMessage(it, UsbAudioProtocol.SESSION_STOP) } } catch (_: Throwable) { }
-        audioRecord?.stop()
+        try { audioRecord?.stop() } catch (_: Throwable) { }
         audioRecord?.release()
-        audioTrack?.stop()
+        try { audioTrack?.stop() } catch (_: Throwable) { }
         audioTrack?.release()
         projection?.stop()
-        socket?.close()
-        serverSocket?.close()
+        try { socket?.close() } catch (_: Throwable) { }
+        try { serverSocket?.close() } catch (_: Throwable) { }
         scheduler.shutdownNow()
         scope.cancel()
         super.onDestroy()
@@ -389,10 +400,5 @@ class UsbDualAudioService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private class MediaProjectionManagerCompat(private val context: Context) {
-        fun create(resultCode: Int, data: Intent): MediaProjection? {
-            val manager = context.getSystemService(android.media.projection.MediaProjectionManager::class.java)
-            return manager?.getMediaProjection(resultCode, data)
-        }
-    }
+    private data class PendingFrame(val sequence: Int, val timestamp: Long, val pcm: ByteArray)
 }
