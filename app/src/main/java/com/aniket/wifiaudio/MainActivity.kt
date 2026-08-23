@@ -16,6 +16,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.aniket.wifiaudio.databinding.ActivityMainBinding
+import com.aniket.wifiaudio.usb.UsbDualAudioActivity
 
 class MainActivity : AppCompatActivity() {
 
@@ -33,14 +34,10 @@ class MainActivity : AppCompatActivity() {
 
     private val recordAudioPermissionLauncher =
         registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) {
-                launchProjectionCapture()
-            } else {
-                binding.statusText.text = "Microphone/audio permission denied — capture can't start"
-            }
+            if (granted) launchProjectionCapture()
+            else binding.statusText.text = "Microphone/audio permission denied — capture can't start"
         }
 
-    // Service reports real capture/server errors here instead of failing silently.
     private val errorReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
@@ -66,13 +63,16 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.toggleButton.setOnClickListener {
-            if (!streaming) {
-                startCaptureFlow()
-            } else {
+            if (!streaming) startCaptureFlow()
+            else {
                 AudioStreamService.stop(this)
                 streaming = false
                 updateUi()
             }
+        }
+
+        binding.usbDualAudioButton.setOnClickListener {
+            startActivity(Intent(this, UsbDualAudioActivity::class.java))
         }
 
         updateUi()
@@ -98,15 +98,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startCaptureFlow() {
-        val hasRecordAudio = ContextCompat.checkSelfPermission(
-            this, Manifest.permission.RECORD_AUDIO
-        ) == PackageManager.PERMISSION_GRANTED
-
-        if (hasRecordAudio) {
-            launchProjectionCapture()
-        } else {
-            recordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-        }
+        val hasRecordAudio = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        if (hasRecordAudio) launchProjectionCapture()
+        else recordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
     }
 
     private fun launchProjectionCapture() {
